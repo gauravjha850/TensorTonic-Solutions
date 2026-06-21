@@ -2,7 +2,8 @@
 #include <math.h>
 #include <float.h>
 
-__global__ void cross_entropy_row_kernel(const float* logits, const int* target, float* partial, int B, int C) {
+// Kernel 1: Computes the unnormalized cross-entropy loss contribution per row
+__global__ void cross_entropy_row_kernel(const float* logits, const int* target, float* partial_loss, int B, int C) {
     // Each block processes exactly one row (one batch element)
     int row = blockIdx.x;
     if (row >= B) return;
@@ -10,9 +11,10 @@ __global__ void cross_entropy_row_kernel(const float* logits, const int* target,
     int tid = threadIdx.x;
     int bdim = blockDim.x;
 
+    // Shared memory allocated for 256 threads
     __shared__ float s_mem[256];
 
-    // --- Step 1: Compute Per-Row Max Logit (Strided Grid-Stride Style Loop for C) ---
+    // --- Step 1: Compute Per-Row Max Logit (Grid-Stride Loop over columns) ---
     float local_max = -FLT_MAX;
     for (int c = tid; c < C; c += bdim) {
         local_max = fmaxf(local_max, logits[row * C + c]);
@@ -20,26 +22,26 @@ __global__ void cross_entropy_row_kernel(const float* logits, const int* target,
     s_mem[tid] = local_max;
     __syncthreads();
 
-    // Block reduction for Maximum
-    for (int stride = bdim / 2; stride > 0; stride /= 2) {
+    // Block-wide parallel tree reduction for the maximum value
+    for (int stride = bdim / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             s_mem[tid] = fmaxf(s_mem[tid], s_mem[tid + stride]);
         }
         __syncthreads();
     }
     float row_max = s_mem[0];
-    __syncthreads();
+    __syncthreads(); // Reuse shared memory safely
 
-    // --- Step 2: Compute Per-Row Sum of Exponentials ---
-    float local_sum_exp = 0.0f;
+    // --- Step 2: Compute Log-Sum-Exp Denominator ---
+    float local_sum = 0.0f;
     for (int c = tid; c < C; c += bdim) {
-        local_sum_exp += expf(logits[row * C + c] - row_max);
+        local_sum += expf(logits[row * C + c] - row_max);
     }
-    s_mem[tid] = local_sum_exp;
+    s_mem[tid] = local_sum;
     __syncthreads();
 
-    // Block reduction for Sum-Exp
-    for (int stride = bdim / 2; stride > 0; stride /= 2) {
+    // Block-wide parallel tree reduction for the sum of exponentials
+    for (int stride = bdim / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             s_mem[tid] += s_mem[tid + stride];
         }
@@ -47,37 +49,44 @@ __global__ void cross_entropy_row_kernel(const float* logits, const int* target,
     }
     float log_sum_exp = logf(s_mem[0]);
 
-    // --- Step 3: Compute Cross-Entropy Loss for this Row ---
+    // --- Step 3: Compute Loss for the Target Class ---
     if (tid == 0) {
-        int t = target[row];
-        float target_logit = logits[row * C + t];
+        int target_class = target[row];
+        float target_logit = logits[row * C + target_class];
         
-        // Log-Softmax: z_t - row_max - log_sum_exp
-        // Cross-Entropy: -Log-Softmax
-        float row_loss = log_sum_exp - (target_logit - row_max);
-        
-        // Atomically accumulate to the global partial sum
-        atomicAdd(partial, row_loss);
+        // Negative Log-Softmax formula: -(z_target - z_max - lse)
+        partial_loss[row] = -(target_logit - row_max - log_sum_exp);
     }
 }
 
-__global__ void cross_entropy_finalize_kernel(float* loss, int B) {
+// Kernel 2: Aggregates the per-batch losses and normalizes by B
+__global__ void cross_entropy_finalize_kernel(const float* partial_loss, float* loss, int B) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        loss[0] = loss[0] / B;
+        float total_loss = 0.0f;
+        for (int i = 0; i < B; ++i) {
+            total_loss += partial_loss[i];
+        }
+        loss[0] = total_loss / B;
     }
 }
 
+// Host entry function
 extern "C" void solve(const float* logits, const int* target, float* loss, int B, int C) {
-    cudaMemset(loss, 0, sizeof(float));
-    
-    // Each row of the batch gets its own block
+    // Allocate device memory for holding each row's individual loss contribution
+    float* d_partial_loss = nullptr;
+    cudaMalloc(&d_partial_loss, B * sizeof(float));
+
+    // Configure a block with 256 threads to perform the reductions smoothly
     int threads = 256;
-    dim3 blocks(B);
-    
-    cross_entropy_row_kernel<<<blocks, threads>>>(logits, target, loss, B, C);
-    
-    // Finalize step divides the global accumulated loss by the batch size B
-    cross_entropy_finalize_kernel<<<1, 1>>>(loss, B);
-    
+    int blocks = B; // One block per row
+
+    // 1. Calculate loss per row with numerical stability tricks
+    cross_entropy_row_kernel<<<blocks, threads>>>(logits, target, d_partial_loss, B, C);
+
+    // 2. Compute the final average over the entire batch size
+    cross_entropy_finalize_kernel<<<1, 1>>>(d_partial_loss, loss, B);
+
+    // Synchronize execution and release temporary device storage
     cudaDeviceSynchronize();
+    cudaFree(d_partial_loss);
 }
